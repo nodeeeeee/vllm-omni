@@ -135,6 +135,76 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
 
 
 @pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
+@pytest.mark.parametrize("strength", [0.5, 0.125])
+def test_refine_preserves_partial_schedules_and_selected_sampler(sampler, strength, mocker):
+    """Refine must re-noise each stream at its start sigma and run only the remaining steps."""
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+        minimax_h3_pack_audio_latent,
+        minimax_h3_patchify_video_latent,
+    )
+
+    model = mocker.Mock(wraps=_SegmentMeanModel())
+    pipeline = _step_pipeline(model)
+    refine = MiniMaxH3LatentRefineSpec(strength=strength)
+    video_latent = torch.full((1, 24, 2, 4, 6), 0.25)
+    audio_latent = torch.full((2, 32, 3), -0.5)
+    kwargs = dict(
+        task="t2va",
+        text_embeddings=torch.zeros(2, _HIDDEN),
+        text_tags=torch.ones(2, dtype=torch.long),
+        seed=17,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+        num_frames=22,
+        num_steps=8,
+        video_shift=12.0,
+        audio_shift=3.0,
+        base_schedule=None,
+        visual_condition=None,
+        visual_condition_shape=None,
+        audio_condition=None,
+        ref_audio_t=None,
+        sampler=sampler,
+        init_latents=(video_latent, audio_latent),
+        refine=refine,
+    )
+    inputs = pipeline._build_denoise_inputs(**kwargs)
+    remaining_steps = round(strength * 8)
+    expected_video_sigmas = _sigmas(8, 12.0)[8 - remaining_steps :]
+    expected_audio_sigmas = _sigmas(8, 3.0)[8 - remaining_steps :]
+    assert inputs["sigmas_video"] == expected_video_sigmas
+    assert inputs["sigmas_audio"] == expected_audio_sigmas
+    noise_video, noise_audio = pipeline._initial_noise(seed=17, latent_t=2, latent_h=4, latent_w=6, audio_t=3)
+    torch.testing.assert_close(
+        inputs["video_rows"], (1 - expected_video_sigmas[0]) * 0.25 + expected_video_sigmas[0] * noise_video
+    )
+    torch.testing.assert_close(
+        inputs["audio_rows"], (1 - expected_audio_sigmas[0]) * -0.5 + expected_audio_sigmas[0] * noise_audio
+    )
+    reference_video, reference_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=inputs["branch"],
+        initial_video_rows=inputs["video_rows"],
+        initial_audio_rows=inputs["audio_rows"],
+        keyframe_cond_rows=None,
+        audio_ref_rows=None,
+        sigmas_video=expected_video_sigmas,
+        sigmas_audio=expected_audio_sigmas,
+        device=torch.device("cpu"),
+        sampler=sampler,
+    )
+    model.reset_mock()
+    actual_video, actual_audio = pipeline.diffuse(**kwargs)
+    assert model.call_count == remaining_steps
+    torch.testing.assert_close(minimax_h3_patchify_video_latent(actual_video, patch_size=(1, 2, 2)), reference_video)
+    torch.testing.assert_close(minimax_h3_pack_audio_latent(actual_audio), reference_audio)
+
+
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
 @pytest.mark.parametrize("num_steps", [1, 8, 50])
 def test_step_execution_matches_request_mode_denoise_loop(num_steps, sampler, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
