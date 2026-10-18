@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request-local deterministic samplers operating on denoised (x0) predictions.
 
-Callers own sigma scheduling, model prediction conversion and conditioning.
-Create one Sampler per request, latent stream and denoising pass. Models with
-specialized samplers can continue to use their own implementations.
+KSAMPLER wraps an algorithm function that owns model evaluation and integration.
+Models supply an x0 callable; schedules and history live in request-local states.
+The legacy precomputed-x0 step helpers remain available for existing callers.
 
 RES coefficients follow ComfyUI_RH_MinMaxH3 sampler_core.py at
 6abdf97ae8cdce548c751ce850adc5010b583b7c. Euler preserves the original
@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, nullcontext
+from copy import copy
+from dataclasses import dataclass, field
 
 import torch
 
@@ -37,8 +40,8 @@ def _validate_sigma(value: float, name: str) -> float:
 def resolve_sampler_name(name: str | None) -> str:
     if name is None:
         return "euler"
-    if name not in ("euler", "res_multistep"):
-        raise ValueError(f"Unsupported sampler: {name!r}; expected euler or res_multistep")
+    if name not in ("euler", "res_multistep", "heun"):
+        raise ValueError(f"Unsupported sampler: {name!r}; expected euler, res_multistep or heun")
     return name
 
 
@@ -52,7 +55,7 @@ def _validate_sigmas(sigmas: Sequence[float]) -> tuple[float, ...]:
 
 
 class BaseSampler(ABC):
-    """Share request-local sigma scheduling and ordered step tracking."""
+    """Legacy update-only interface for callers supplying precomputed x0."""
 
     def __init__(self, sigmas: Sequence[float]) -> None:
         self.sigmas = _validate_sigmas(sigmas)
@@ -159,17 +162,231 @@ class ResMultistepSampler(BaseSampler):
         return coeffs
 
 
-class Sampler:
-    """Select and delegate to a sampler over decreasing sigmas in [0, 1].
+Latents = tuple[torch.Tensor, ...]
 
-    ``step`` consumes an x0 prediction, not raw model velocity or epsilon.
-    Steps must be consumed once in order; start a new instance for a new pass.
+
+@dataclass(eq=False)
+class SamplingState:
+    """Keep latents, sigmas, step_index, and RES history for one request.
+
+    The sampler updates this state after each step and uses it to continue
+    sampling on the next call.
     """
 
-    def __init__(self, name: str | None, sigmas: Sequence[float]) -> None:
-        self.name = resolve_sampler_name(name)
-        sampler_cls = EulerSampler if self.name == "euler" else ResMultistepSampler
-        self._sampler = sampler_cls(sigmas)
+    latents: Latents
+    sigmas: tuple[Sequence[float], ...]
+    step_index: int = 0
+    history: list[ResMultistepSampler] = field(init=False, repr=False)
 
-    def step(self, state: torch.Tensor, denoised: torch.Tensor, step: int) -> torch.Tensor:
-        return self._sampler.step(state, denoised, step)
+    def __post_init__(self) -> None:
+        self.sigmas = tuple(_validate_sigmas(s) for s in self.sigmas)
+        if not self.latents or len(self.latents) != len(self.sigmas):
+            raise ValueError("Each latent stream requires one sigma schedule")
+        if any(len(s) != len(self.sigmas[0]) for s in self.sigmas):
+            raise ValueError("Coupled sigma schedules must have equal lengths")
+        if self.step_index != 0:
+            raise ValueError("New sampling states must start at step zero")
+        self.history = [ResMultistepSampler(s) for s in self.sigmas]
+
+    @property
+    def finished(self) -> bool:
+        return self.step_index == len(self.sigmas[0]) - 1
+
+
+@dataclass
+class ModelEvaluation:
+    """One prediction, which may evaluate a temporary state within a solver step."""
+
+    state: SamplingState
+    latents: Latents
+    sigmas: tuple[float, ...]
+
+
+DenoiseModel = Callable[[Sequence[ModelEvaluation]], Sequence[Latents]]
+SampleCallback = Callable[[SamplingState], None]
+StepContext = Callable[[Sequence[SamplingState]], AbstractContextManager]
+
+
+def _evaluate(model: DenoiseModel, evaluations: list[ModelEvaluation]) -> Sequence[Latents]:
+    for evaluation in evaluations:
+        for latent in evaluation.latents:
+            if not torch.is_floating_point(latent):
+                raise ValueError("Latents must be floating point")
+            _require_finite_tensor(latent, "Model input")
+    predictions = model(evaluations)
+    if len(predictions) != len(evaluations):
+        raise ValueError("Model must return one prediction per request")
+    for evaluation, prediction in zip(evaluations, predictions, strict=True):
+        if len(prediction) != len(evaluation.latents):
+            raise ValueError("Model must return one x0 per latent stream")
+        for x, x0 in zip(evaluation.latents, prediction, strict=True):
+            if x.shape != x0.shape or not torch.is_floating_point(x0):
+                raise ValueError("Model predictions must match latent shapes and be floating point")
+            _require_finite_tensor(x0, "Model prediction")
+    return predictions
+
+
+def _sampling_steps(states: Sequence[SamplingState], num_steps: int | None) -> Iterator[list[SamplingState]]:
+    if num_steps is not None and num_steps < 1:
+        raise ValueError("num_steps must be positive")
+    if len({id(state) for state in states}) != len(states):
+        raise ValueError("Sampling states must be unique within a batch")
+    count = 0
+    while active := [s for s in states if not s.finished]:
+        if num_steps is not None and count >= num_steps:
+            break
+        yield active
+        count += 1
+
+
+def _current_evaluations(states: Sequence[SamplingState]) -> list[ModelEvaluation]:
+    return [ModelEvaluation(s, s.latents, tuple(v[s.step_index] for v in s.sigmas)) for s in states]
+
+
+def _commit(states: Sequence[SamplingState], outputs: Sequence[Latents], callback: SampleCallback | None) -> None:
+    # Validate the whole batch before publishing any of its new latent states.
+    for output in outputs:
+        for tensor in output:
+            _require_finite_tensor(tensor, "Sampler output")
+    for state, output in zip(states, outputs, strict=True):
+        state.latents = tuple(output)
+        state.step_index += 1
+    if callback:
+        for state in states:
+            callback(state)
+
+
+def sample_euler(
+    model: DenoiseModel,
+    states: Sequence[SamplingState],
+    *,
+    num_steps: int | None = None,
+    callback: SampleCallback | None = None,
+    step_context: StepContext | None = None,
+) -> None:
+    """Euler integration; the algorithm owns every model call."""
+    for active in _sampling_steps(states, num_steps):
+        with step_context(active) if step_context else nullcontext():
+            predictions = _evaluate(model, _current_evaluations(active))
+            outputs = [
+                tuple(
+                    EulerSampler.step_denoised(
+                        x, x0, sigma_curr=s[state.step_index], sigma_next=s[state.step_index + 1]
+                    )
+                    for x, x0, s in zip(state.latents, prediction, state.sigmas, strict=True)
+                )
+                for state, prediction in zip(active, predictions, strict=True)
+            ]
+            _commit(active, outputs, callback)
+
+
+def sample_res_multistep(
+    model: DenoiseModel,
+    states: Sequence[SamplingState],
+    *,
+    num_steps: int | None = None,
+    callback: SampleCallback | None = None,
+    step_context: StepContext | None = None,
+) -> None:
+    """RES integration with request-local, transactional prediction history."""
+    for active in _sampling_steps(states, num_steps):
+        with step_context(active) if step_context else nullcontext():
+            predictions = _evaluate(model, _current_evaluations(active))
+            histories = [[copy(h) for h in state.history] for state in active]
+            outputs = [
+                tuple(
+                    h.step(x, x0, state.step_index) for h, x, x0 in zip(history, state.latents, prediction, strict=True)
+                )
+                for state, history, prediction in zip(active, histories, predictions, strict=True)
+            ]
+            for state, history in zip(active, histories, strict=True):
+                state.history = history
+            _commit(active, outputs, callback)
+
+
+def sample_heun(
+    model: DenoiseModel,
+    states: Sequence[SamplingState],
+    *,
+    num_steps: int | None = None,
+    callback: SampleCallback | None = None,
+    step_context: StepContext | None = None,
+) -> None:
+    """Predict, evaluate the Euler proposal, then combine both derivatives."""
+    for active in _sampling_steps(states, num_steps):
+        with step_context(active) if step_context else nullcontext():
+            predictions = _evaluate(model, _current_evaluations(active))
+            derivatives, proposals, corrections = [], [], []
+            for state, prediction in zip(active, predictions, strict=True):
+                ds, trial = [], []
+                for x, x0, schedule in zip(state.latents, prediction, state.sigmas, strict=True):
+                    curr, nxt = schedule[state.step_index : state.step_index + 2]
+                    dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+                    d = (x.to(dtype) - x0.to(dtype)) / curr
+                    ds.append(d)
+                    trial.append((x.to(dtype) + (nxt - curr) * d).to(x.dtype))
+                derivatives.append(ds)
+                proposals.append(tuple(trial))
+                next_sigmas = tuple(s[state.step_index + 1] for s in state.sigmas)
+                if any(s > 0 for s in next_sigmas):
+                    corrections.append(ModelEvaluation(state, tuple(trial), next_sigmas))
+            corrected = _evaluate(model, corrections) if corrections else []
+            by_state = {evaluation.state: pred for evaluation, pred in zip(corrections, corrected, strict=True)}
+            outputs = []
+            for state, ds, trial in zip(active, derivatives, proposals, strict=True):
+                output = []
+                for j, (x, d, proposal, schedule) in enumerate(
+                    zip(state.latents, ds, trial, state.sigmas, strict=True)
+                ):
+                    curr, nxt = schedule[state.step_index : state.step_index + 2]
+                    if nxt == 0:
+                        output.append(proposal)
+                    else:
+                        d2 = (proposal.to(d.dtype) - by_state[state][j].to(d.dtype)) / nxt
+                        output.append((x.to(d.dtype) + (nxt - curr) * (d + d2) / 2).to(x.dtype))
+                outputs.append(tuple(output))
+            _commit(active, outputs, callback)
+
+
+class Sampler(ABC):
+    """ComfyUI-style sampler interface; models expose prediction, not sampling."""
+
+    @abstractmethod
+    def sample(
+        self,
+        model: DenoiseModel,
+        states: Sequence[SamplingState],
+        *,
+        num_steps: int | None = None,
+        callback: SampleCallback | None = None,
+        step_context: StepContext | None = None,
+    ) -> None: ...
+
+
+class KSAMPLER(Sampler):
+    """Wrap an algorithm function independently of any model or request.
+
+    sample() updates the supplied request states. num_steps=None runs each to
+    completion; num_steps=1 yields control to the serving scheduler after one
+    complete algorithm step, including all of its model evaluations. Callbacks
+    observe committed states; step_context encloses prediction and update.
+    """
+
+    def __init__(self, sampler_function: Callable) -> None:
+        self.sampler_function = sampler_function
+
+    def sample(
+        self,
+        model: DenoiseModel,
+        states: Sequence[SamplingState],
+        *,
+        num_steps: int | None = None,
+        callback: SampleCallback | None = None,
+        step_context: StepContext | None = None,
+    ) -> None:
+        self.sampler_function(model, states, num_steps=num_steps, callback=callback, step_context=step_context)
+
+
+def sampler_object(name: str | None = None) -> KSAMPLER:
+    functions = {"euler": sample_euler, "res_multistep": sample_res_multistep, "heun": sample_heun}
+    return KSAMPLER(functions[resolve_sampler_name(name)])
