@@ -614,6 +614,10 @@ class MiniMaxH3Pipeline(
 
     supports_step_execution: ClassVar[bool] = True
     denoise_step_updates_state: ClassVar[bool] = True
+    # DiT implementation constructed for the primary ``transformer``.
+    # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
+    # a derived pipeline may point this at a subclass.
+    _transformer_cls: ClassVar[type[MiniMaxH3DiTModel] | None] = None
     load_vae_decoder: bool = True
     supports_request_cancellation: ClassVar[bool] = True
 
@@ -971,7 +975,8 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
-        self.transformer = MiniMaxH3DiTModel(
+        transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
+        self.transformer = transformer_cls(
             od_config,
             quant_config=transformer_quant_config,
             diffusers_weights=modular,
