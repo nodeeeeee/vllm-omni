@@ -503,6 +503,7 @@ def test_both_modes_publish_denoise_progress_for_gated_attention():
         def __init__(self):
             self.denoise_step_idx = None
             self.denoise_timestep = None
+            self.denoise_progress = {}
 
         def __setattr__(self, name, value):
             object.__setattr__(self, name, value)
@@ -766,6 +767,54 @@ def test_heun_batches_correction_and_skips_terminal_requests(packed):
         assert len(model.calls[0]["video_rows"]) == sum(len(s.latents) for s in states)
         assert len(model.calls[1]["video_rows"]) == sum(len(s.latents) for s in states[:2])
     assert all(s.step_index == 1 for s in states)
+
+
+def test_mixed_progress_reaches_model_for_each_heun_evaluation(monkeypatch):
+    from vllm_omni.diffusion import forward_context as fc
+    from vllm_omni.diffusion.attention.backends.abstract import DenoiseProgress
+
+    context = fc.ForwardContext()
+    monkeypatch.setattr(fc, "_forward_context", context)
+    recorded = []
+
+    class RecordingModel(_SegmentMeanModel):
+        def __call__(self, **kwargs):
+            recorded.append(context.denoise_progress)
+            return super().__call__(**kwargs)
+
+    model = RecordingModel()
+    states, branches = [], []
+    schedule = [1.0, 0.5, 0.2, 0.0]
+    for index in range(2):
+        branch, video, audio = _make_branch(
+            text_len=5 + index, latent_t=2, latent_h=4, latent_w=4, audio_t=3, seed=index
+        )
+        branches.append(branch)
+        states.append(_make_state(str(index), model, branch, video, audio, schedule, schedule, "heun"))
+    pipeline = _step_pipeline(model)
+    for _ in range(2):
+        result = pipeline.denoise_step(SimpleNamespace(states=[states[1]]))
+        assert result == {"1": None}
+    recorded.clear()
+    context.denoise_progress = {"self": (DenoiseProgress(1, 99, 0.123, 100),)}
+    result = pipeline.denoise_step(SimpleNamespace(states=states))
+    assert result == {"0": None, "1": None}
+    assert len(recorded) == 2
+    for actual, indices, times, steps in (
+        (recorded[0], (0, 1), (1.0, 0.2), (0, 2)),
+        (recorded[1], (0,), (0.5,), (0,)),
+    ):
+        assert actual["minimax_h3.token_refiner"] == tuple(
+            DenoiseProgress(branches[i].text_len, step, time, 3)
+            for i, time, step in zip(indices, times, steps, strict=True)
+        )
+        assert actual["self"] == tuple(
+            DenoiseProgress(length, step, time, 3)
+            for i, time, step in zip(indices, times, steps, strict=True)
+            for length in (branches[i].used_len, branches[i].seq_len - branches[i].used_len)
+            if length
+        )
+    assert context.denoise_progress == {}
 
 
 def test_heun_failed_correction_keeps_both_streams_and_history_retryable():

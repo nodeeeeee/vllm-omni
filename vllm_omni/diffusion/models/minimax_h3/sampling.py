@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm_omni.diffusion.attention.backends.abstract import DenoiseProgress
 from vllm_omni.diffusion.cancellation import check_request_cancellation
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.sampler import ModelEvaluation, SamplingState
 
 from .latent_mask import MiniMaxH3LatentEdit
@@ -115,7 +117,22 @@ class MiniMaxH3ModelBatch:
         prepared = [m.prepare(e) for m, e in zip(models, evaluations, strict=True)]
         progress = {(e.state.step_index, e.sigmas[0], len(e.state.sigmas[0]) - 1) for e in evaluations}
         minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
+        context = get_forward_context() if is_forward_context_available() else None
         try:
+            if context is not None:
+                context.denoise_progress = {
+                    role: tuple(
+                        DenoiseProgress(length, e.state.step_index, e.sigmas[0], len(e.state.sigmas[0]) - 1)
+                        for m, e in zip(models, evaluations, strict=True)
+                        for length in (
+                            (m.branch.text_len,)
+                            if role == "minimax_h3.token_refiner"
+                            else (m.branch.used_len, m.branch.seq_len - m.branch.used_len)
+                        )
+                        if length
+                    )
+                    for role in ("minimax_h3.token_refiner", "self")
+                }
             if len(models) == 1:
                 _, rows, times, cond = prepared[0]
                 kwargs = models[0].branch.forward_kwargs(
@@ -148,4 +165,6 @@ class MiniMaxH3ModelBatch:
                 m.to_denoised(p, (v, a)) for m, p, v, a in zip(models, prepared, video_parts, audio_parts, strict=True)
             ]
         finally:
+            if context is not None:
+                context.denoise_progress = {}
             minimax_h3_publish_denoise_progress(None, None, None)
